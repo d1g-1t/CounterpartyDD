@@ -1,0 +1,119 @@
+name: ${COMPOSE_PROJECT_NAME:-counterpartydd}
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: docker/Dockerfile
+    target: runtime
+  env_file: .env
+  environment:
+    CDD_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cdd}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-counterparty_dd}
+    CDD_REDIS_URL: redis://redis:6379/0
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    restart: "no"
+    healthcheck:
+      disable: true
+
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-20300}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health').status==200 else 1)",
+        ]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
+
+  worker:
+    <<: *app
+    command:
+      [
+        "celery",
+        "-A",
+        "counterparty_dd.infrastructure.worker:celery_app",
+        "worker",
+        "-B",
+        "--loglevel",
+        "INFO",
+        "-s",
+        "/tmp/celerybeat-schedule",
+      ]
+    healthcheck:
+      disable: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cdd}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-counterparty_dd}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cdd} -d ${POSTGRES_DB:-counterparty_dd}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  test:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: dev
+    env_file: .env
+    environment:
+      CDD_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cdd}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-counterparty_dd}
+      CDD_REDIS_URL: redis://redis:6379/0
+      CDD_TEST_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-cdd}:${POSTGRES_PASSWORD}@postgres:5432/counterparty_dd_test
+      CDD_TEST_REDIS_URL: redis://redis:6379/15
+      CDD_TOKEN_SECRET: ${CDD_TOKEN_SECRET}
+      CDD_AUDIT_SECRET: ${CDD_AUDIT_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: ["pytest", "-q"]
+
+volumes:
+  pgdata:
